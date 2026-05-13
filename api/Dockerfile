@@ -17,7 +17,9 @@ RUN pip install .
 COPY app ./app
 COPY alembic.ini ./
 COPY alembic ./alembic
+COPY entrypoint.sh ./entrypoint.sh
+RUN chmod +x ./entrypoint.sh
 
 EXPOSE 8000
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["./entrypoint.sh"]
