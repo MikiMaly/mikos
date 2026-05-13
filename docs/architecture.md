@@ -1,258 +1,295 @@
 # Mikos — Personal OS: Architektura
 
-Single-user osobní operační systém pro správu tasků (pravidelných i nepravidelných)
-a vizualizaci zdravotních dat z Garminu (MVP: spánek).
+Headless backend pro správu tasků (pravidelných i nepravidelných) a zdravotních
+dat z Garminu. Dashboard renderuje [`MikiMaly/hub`](https://github.com/MikiMaly/hub)
+(React + Vite na Cloudflare Pages, mmaly.cz) v privátní sekci.
 
 ## 1. Cíle a non-cíle
 
 **Cíle (MVP)**
-- Jeden dashboard: "Co mám dnes" — tasky + včerejší spánek + 7d trend
-- Pravidelné tasky (RRULE: daily / weekly / custom) i ad-hoc tasky
+- Headless REST API pro tasky a Garmin sleep data
+- Pravidelné tasky (RRULE) i nepravidelné (one-off)
 - Automatická denní synchronizace spánku z Garmin Connect
-- Self-hosted, data lokálně, přístup z desktopu i mobilu (responsive web)
+- Bezpečný vzdálený přístup z `mmaly.cz/private/*` bez veřejného portu doma
+- SSO přes Cloudflare Access — jeden login pro hub i Mikos
 
-**Non-cíle (zatím)**
-- Multi-user, sdílení, kolaborace
-- Kalendář sync (Google/CalDAV) — později
-- Habit tracking, journal — později
-- Native mobile aplikace — později (PWA stačí)
-- Real-time spolupráce
+**Non-cíle**
+- Mikos nemá vlastní frontend ani UI — všechno UI vlastní hub
+- Multi-user, sdílení
+- Vlastní auth (login form, password reset, …) — řeší CF Access
+- Kalendář, habits, journal — backlog post-MVP
 
-## 2. High-level topologie
+## 2. Topologie
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     Browser (desktop / mobil)                │
-│                     Next.js — responsive web                 │
-└──────────────────────────────┬──────────────────────────────┘
-                               │ HTTPS (REST + JSON)
-                               ▼
-┌─────────────────────────────────────────────────────────────┐
-│   Reverse proxy (Caddy / nginx) — TLS, auth gate            │
-└──────────────────────────────┬──────────────────────────────┘
-                               │
-        ┌──────────────────────┼──────────────────────┐
-        ▼                      ▼                      ▼
-┌──────────────┐      ┌──────────────────┐    ┌──────────────┐
-│  API server  │      │   Scheduler /    │    │  PostgreSQL  │
-│   FastAPI    │◄────►│   Worker         │◄──►│      16      │
-│              │      │   APScheduler    │    │              │
-└──────┬───────┘      └────────┬─────────┘    └──────────────┘
-       │                       │
-       │                       │  nightly @ 06:00
-       │                       ▼
-       │              ┌────────────────────┐
-       └─────────────►│  GarminAdapter     │
-                      │  python-garmin-    │
-                      │  connect           │
-                      └────────┬───────────┘
-                               │
-                               ▼
-                      Garmin Connect (externí)
+                  ┌──────────────────────────────────────┐
+                  │  Browser (desktop / mobil)           │
+                  └─────────────────┬────────────────────┘
+                                    │ HTTPS
+                                    ▼
+        ┌───────────────────────────────────────────────────┐
+        │  mmaly.cz  —  Cloudflare Pages  (repo: hub)       │
+        │  React + Vite SPA                                 │
+        │  ├── /                public landing              │
+        │  └── /private/*       dashboard (Mikos widgety)   │
+        └─────────────────┬─────────────────────────────────┘
+                          │  fetch('https://mikos-api.mmaly.cz/...')
+                          │  Cookie: CF_Authorization=<jwt>
+                          ▼
+        ┌───────────────────────────────────────────────────┐
+        │  Cloudflare Access  (Zero Trust)                  │
+        │  Chrání:                                          │
+        │    - mmaly.cz/private/*                           │
+        │    - mikos-api.mmaly.cz                           │
+        │  Vystavuje Cf-Access-Jwt-Assertion header.        │
+        └─────────────────┬─────────────────────────────────┘
+                          │
+                          ▼
+        ┌───────────────────────────────────────────────────┐
+        │  Cloudflare Tunnel  (cloudflared, žádný open port)│
+        └─────────────────┬─────────────────────────────────┘
+                          │
+                          ▼
+        ┌───────────────────────────────────────────────────┐
+        │  Mikos doma — Docker Compose                      │
+        │   ┌─────────┐  ┌──────────┐  ┌────────────────┐   │
+        │   │   api   │  │  worker  │  │  postgres 16   │   │
+        │   │ FastAPI │  │APScheduler│  │                │   │
+        │   └────┬────┘  └─────┬────┘  └────────────────┘   │
+        │        └──────┬──────┘                            │
+        │               ▼                                   │
+        │      Garmin Connect (externí, nightly)            │
+        └───────────────────────────────────────────────────┘
 ```
-
-Vše v Docker Compose. Vzdálený přístup přes Tailscale (preferováno — žádný
-veřejný port) nebo Cloudflare Tunnel.
 
 ## 3. Komponenty
 
-### 3.1 Frontend — `web/`
-- **Next.js** (App Router), TypeScript
-- **TanStack Query** pro server state
-- **shadcn/ui** + Tailwind
-- **PWA** manifest + service worker (offline cache dashboardu)
+### 3.1 Hub (mimo tento repo)
+- Repo `MikiMaly/hub`, React + Vite, deploy na Cloudflare Pages
+- Privátní sekce `/private/*` — Mikos dashboard
+- Volá Mikos API přes `fetch`, **žádný sdílený UI package** (hub si komponenty
+  kreslí sám podle vlastního design systému)
+- API base URL z env (`VITE_MIKOS_API_URL=https://mikos-api.mmaly.cz`)
 
-Klíčové stránky:
-- `/` — Today: dnešní výskyty tasků + sleep card + quick add
-- `/tasks` — všechny tasky, filtry, recurrence editor
-- `/health/sleep` — detail + trendy (7d / 30d / 90d)
-- `/settings` — Garmin login, nastavení sync
-
-### 3.2 Backend — `api/`
+### 3.2 Mikos API — `api/`
 - **FastAPI**, Python 3.12
-- **SQLAlchemy 2** + **Alembic** migrations
+- **SQLAlchemy 2** + **Alembic**
 - **Pydantic v2** schémata
-- Auth: jednoduchý session cookie (single-user, žádné OAuth)
+- Žádný session login. Auth = validace `Cf-Access-Jwt-Assertion` header v middleware.
+- CORS: povolen origin `https://mmaly.cz`, credentials včetně cookies
 
-### 3.3 Scheduler — `worker/`
-Sdílený codebase s API, ale samostatný proces v Compose:
-- Materializace RRULE → konkrétní `task_occurrence` rows (rolling 60denní okno)
-- Nightly Garmin sync (06:00 lokální čas)
-- Retry policy s exponenciálním backoffem
+### 3.3 Worker — `worker/`
+Stejný image jako api, jiný entrypoint:
+- Hodinová materializace RRULE → `task_occurrences` (rolling 60denní okno)
+- Nightly Garmin sync (06:00 Europe/Prague)
+- Retry s exponenciálním backoffem, audit do `sync_runs`
 
 ### 3.4 Storage
-- **PostgreSQL 16** — primární store
-- **Volume** pro `pgdata`, denní `pg_dump` do `backups/` (samostatný kontejner s cronem)
+- **PostgreSQL 16**, volume `pgdata`
+- Denní `pg_dump` do `backups/` (samostatný kontejner s cronem)
 
-## 4. Datový model
+### 3.5 Edge — `infra/`
+- `cloudflared` kontejner s tunnel config (point na `api:8000`)
+- Cloudflare Access policy v dashboardu — email rule pro tebe
+
+## 4. Auth contract
+
+**Hub → API:**
+1. Uživatel jde na `mmaly.cz/private/dashboard`
+2. CF Access zachytí → login (Google / GitHub / email OTP, podle CF nastavení)
+3. CF vystaví cookie `CF_Authorization=<jwt>` pro `*.mmaly.cz`
+4. SPA volá `fetch('https://mikos-api.mmaly.cz/api/today', { credentials: 'include' })`
+5. CF Access propustí jen s platným JWT, do upstream requestu přidá
+   `Cf-Access-Jwt-Assertion` header
+
+**Mikos middleware:**
+1. Čte `Cf-Access-Jwt-Assertion`
+2. Validuje podpis proti JWKS `https://<team>.cloudflareaccess.com/cdn-cgi/access/certs`
+   (cache 1 h)
+3. Ověří `aud` claim = AUD tag aplikace
+4. Ověří `email` claim je v allowlistu (z env `MIKOS_ALLOWED_EMAILS`)
+5. Bez headeru / nevalidní JWT → 401
+
+**Lokální dev:** middleware má override v `DEV_MODE=1` — přijme všechno z
+`localhost`, hub volá `http://localhost:8000` napřímo.
+
+## 5. Datový model
 
 ```
-users                          (single row — single user, ale schéma připravené)
-  id, name, timezone, created_at
+users
+  id, email (unique), name, timezone, created_at
+  -- single-user MVP, ale per-email lookup z JWT
 
-tasks                          (definice — pro recurring i one-off)
+tasks
   id, user_id, title, description, priority, tags[],
-  due_at TIMESTAMPTZ NULL,     -- one-off task má due_at, recurring má NULL
-  rrule TEXT NULL,             -- RFC 5545 (např. "FREQ=WEEKLY;BYDAY=MO,WE")
+  due_at TIMESTAMPTZ NULL,
+  rrule TEXT NULL,                  -- RFC 5545
   rrule_start DATE NULL,
   rrule_end DATE NULL,
   status ENUM('active','archived'),
   created_at, updated_at
 
-task_occurrences               (materializované výskyty — co je v daný den "to do")
+task_occurrences
   id, task_id, occurs_on DATE, occurs_at TIMESTAMPTZ NULL,
   status ENUM('pending','done','skipped'),
   completed_at TIMESTAMPTZ NULL,
   notes TEXT,
   UNIQUE(task_id, occurs_on)
 
-sleep_sessions                 (Garmin sleep — denní záznam)
-  id, user_id, date DATE,      -- "noc končící touto datem"
+sleep_sessions
+  id, user_id, date DATE,           -- "noc končící tímto datem v user TZ"
   start_at TIMESTAMPTZ, end_at TIMESTAMPTZ,
   duration_seconds INT,
   deep_seconds INT, light_seconds INT, rem_seconds INT, awake_seconds INT,
-  score INT NULL,              -- Garmin sleep score 0–100
+  score INT NULL,
   hrv_avg_ms FLOAT NULL,
   resting_hr INT NULL,
-  raw JSONB,                   -- celý payload pro pozdější use-cases
+  raw JSONB,
   source TEXT DEFAULT 'garmin',
   fetched_at TIMESTAMPTZ,
   UNIQUE(user_id, date)
 
-sync_runs                      (audit log pro nightly job)
+sync_runs
   id, source, started_at, finished_at, status, error TEXT, records_upserted INT
+
+garmin_credentials
+  user_id PK, email_enc BYTEA, password_enc BYTEA, session_token_enc BYTEA NULL,
+  updated_at
+  -- šifrováno Fernet, klíč v MIKOS_FERNET_KEY env
 ```
 
-**Proč materializovat occurrences místo počítat RRULE on-the-fly:**
-- Stav (done/skipped) musí být per-výskyt — nestačí RRULE definice
-- Rychlé dotazy "co je dnes" / "co bylo tento týden" bez expanze pravidla
-- Trade-off: trochu složitější logika při editaci RRULE (regenerace budoucích occurrences)
+## 6. API contract
 
-## 5. API design (klíčové endpointy)
+Base: `https://mikos-api.mmaly.cz`
 
 ```
-GET    /api/today                       → { tasks: [...occurrences], sleep: {...} }
+GET    /api/today                       → { tasks: Occurrence[], sleep: Sleep | null }
 GET    /api/tasks?status=active
 POST   /api/tasks                       { title, due_at | rrule, ... }
 PATCH  /api/tasks/{id}
 DELETE /api/tasks/{id}
 POST   /api/occurrences/{id}/complete
 POST   /api/occurrences/{id}/skip
+POST   /api/occurrences/{id}/reschedule { occurs_at }
 
-GET    /api/health/sleep?from=...&to=...
+GET    /api/health/sleep?from=YYYY-MM-DD&to=YYYY-MM-DD
 GET    /api/health/sleep/latest
 
-POST   /api/sync/garmin                 → vynucený resync (manuálně z UI)
-GET    /api/sync/runs                   → historie sync jobů
+POST   /api/sync/garmin                 → 202 + run_id
+GET    /api/sync/runs?source=garmin
+
+POST   /api/settings/garmin             { email, password }   -- upsert creds
+GET    /api/settings/garmin/status      → { connected, last_sync_at }
 ```
 
-## 6. Garmin integrace
+Všechny endpointy: JSON in/out, `Cf-Access-Jwt-Assertion` required (nebo
+`DEV_MODE=1` lokálně).
 
-**Knihovna:** [`python-garminconnect`](https://github.com/cyberjunky/python-garminconnect)
-(unofficial, login Garmin Connect účtem).
+## 7. Garmin integrace
 
-**Flow:**
-1. V `/settings` user zadá Garmin email + heslo → uloženo zašifrovaně v DB
-   (Fernet key v `.env`, mimo repo)
-2. `GarminAdapter` se přihlásí, drží session token (refresh při expiraci)
-3. Nightly job (06:00 lokálního času uživatele) stáhne sleep data za poslední 2 noci
-   (idempotentní upsert podle `(user_id, date)`)
-4. Při změně API knihovny → fallback: log error do `sync_runs`, UI ukáže warning banner
+- Knihovna [`python-garminconnect`](https://github.com/cyberjunky/python-garminconnect)
+- Credentials uložené v `garmin_credentials` šifrované Fernet (klíč mimo repo)
+- Nightly job: stáhne sleep za poslední 2 noci, upsert podle `(user_id, date)`
+- Při změně Garmin API → error do `sync_runs`, GET `/api/sync/runs` to ukáže
+  v UI banner
+- Abstrakce `HealthSource` interface pro pozdější Whoop / Oura / Apple Health
 
-**Bezpečnost:** Credentials nikdy nelogovat, šifrovat at-rest, žádné odesílání mimo
-lokální stack.
+## 8. Recurrence model
 
-**Abstrakce:** `HealthSource` interface (`fetch_sleep(date_range) -> list[SleepRecord]`),
-ať pozdější přidání Whoop / Oura / Apple Health nevyžaduje refactor.
+- Task s `rrule` je šablona, neukazuje se sám v Today
+- Worker hodinově expanduje RRULE od `today` do `today + 60 dní`, upsert
+  pending occurrences
+- Edit RRULE: smaž budoucí `pending` occurrences daného tasku → regenerace
+- Per-výskyt override (přesun, skip) zůstává — šablona je nemění
 
-## 7. Recurrence model (detail)
+## 9. Deployment
 
-- Task s `rrule` je "šablona", neukazuje se sám v Today view
-- Worker každou hodinu spustí `materialize_occurrences()`:
-  - Pro každý active recurring task expanduje RRULE od `today` do `today + 60 dní`
-  - Upsertem (`task_id`, `occurs_on`) doplní chybějící pending occurrences
-  - Neměnit existující dokončené ani manuálně upravené
-- Edit RRULE: smazat budoucí pending occurrences daného tasku → regenerace
-- Edit jednoho výskytu (např. přesun jen tohoto): override flag, nedotčen šablonou
-
-## 8. Deployment
-
-`docker-compose.yml`:
+`infra/docker-compose.yml`:
 ```
 services:
-  web:        Next.js (build → standalone)
-  api:        FastAPI + uvicorn
-  worker:     stejný image jako api, jiný entrypoint
-  db:         postgres:16-alpine, volume pgdata
-  caddy:      reverse proxy + auto TLS (pro Tailscale není potřeba, jen pro CF tunnel)
-  backups:    cron kontejner, denní pg_dump → ./backups/
+  api:          FastAPI + uvicorn, expose 8000 jen v interní síti
+  worker:       stejný image, entrypoint = scheduler
+  db:           postgres:16-alpine, volume pgdata
+  cloudflared:  Cloudflare Tunnel, point na api:8000
+  backups:      cron kontejner, denní pg_dump → ./backups/
 ```
 
-**Vzdálený přístup (doporučeno):** Tailscale — žádný veřejný port, žádné TLS
-certifikáty, telefon i laptop ve stejné tailnet, přístup přes
-`http://mikos.tail-scale.ts.net`.
+`.env` (gitignored):
+```
+DATABASE_URL=postgresql://...
+MIKOS_FERNET_KEY=<base64>
+CF_ACCESS_TEAM_DOMAIN=mmaly.cloudflareaccess.com
+CF_ACCESS_AUD=<app aud tag z CF dashboardu>
+MIKOS_ALLOWED_EMAILS=miki@example.com
+TZ=Europe/Prague
+DEV_MODE=0
+```
 
-**Konfigurace:** `.env` (gitignored) — `DATABASE_URL`, `GARMIN_FERNET_KEY`,
-`SESSION_SECRET`, `TZ`.
+**Cloudflare nastavení (mimo kód):**
+- DNS: `mikos-api.mmaly.cz` → CNAME na tunnel hostname
+- Access application: `mikos-api.mmaly.cz`, policy email = tvůj email
+- Druhá Access application: `mmaly.cz/private/*` (totéž)
 
-## 9. Struktura repa
+## 10. Struktura repa
 
 ```
 mikos/
 ├── docs/
-│   └── architecture.md       (tento dokument)
-├── api/                      (FastAPI + Alembic)
+│   └── architecture.md
+├── api/                        (FastAPI)
 │   ├── app/
-│   │   ├── domain/           (tasks, health — čisté doménové modely)
-│   │   ├── adapters/         (garmin, …)
-│   │   ├── api/              (routery)
-│   │   ├── db/               (models, migrations)
-│   │   └── scheduler/        (APScheduler jobs)
-│   └── pyproject.toml
-├── web/                      (Next.js)
-│   ├── app/
-│   ├── components/
-│   └── package.json
+│   │   ├── auth/               (CF Access JWT middleware)
+│   │   ├── domain/             (tasks, health — doménové modely)
+│   │   ├── adapters/           (garmin, ...)
+│   │   ├── api/                (routery)
+│   │   ├── db/                 (modely, alembic)
+│   │   └── scheduler/          (APScheduler jobs)
+│   ├── tests/
+│   ├── pyproject.toml
+│   └── Dockerfile
 ├── infra/
 │   ├── docker-compose.yml
-│   └── caddy/Caddyfile
+│   ├── cloudflared/config.yml
+│   └── backups/cron
 └── README.md
 ```
 
-## 10. Roadmap
-
-**M0 — Kostra (1–2 dny práce)**
-- Repo skeleton, Docker Compose, Postgres, prázdné Next.js + FastAPI, health check
-
-**M1 — Tasky (3–5 dní)**
-- CRUD tasků, RRULE, materializace occurrences, Today view, complete/skip
-
-**M2 — Garmin sleep (2–3 dny)**
-- Adapter, nightly sync, šifrované credentials, sleep card na dashboardu, detail stránka
-
-**M3 — Polish (1–2 dny)**
-- PWA manifest, backupy, error states, manuální resync button
-
-**Backlog (post-MVP):** kalendář sync, HRV/steps/stress, habit tracking, journal,
-korelace spánek ↔ task completion, push notifikace.
-
-## 11. Klíčová rozhodnutí (rozhodnuto)
+## 11. Rozhodnutí
 
 | Otázka | Volba | Důvod |
 |---|---|---|
-| Hosting | Self-hosted Docker | Privacy zdravotních dat, plná kontrola |
-| Klient | Responsive web + PWA | Jeden codebase, mobil i desktop |
-| Garmin | `python-garminconnect` | Funguje hned, žádný schvalovací proces |
-| MVP scope | Tasks + sleep | Minimální, rychle do produkce |
-| Recurrence | RFC 5545 RRULE + materializované occurrences | Standard + per-výskyt state |
-| Backend lang | Python | Ekosystém pro Garmin + datové práce |
-| DB | PostgreSQL | RRULE/JSONB/time-range queries, robustní |
+| Frontend | Žije v hub repu (React + Vite) | mmaly.cz už na CF Pages, sdílený design |
+| UI sdílení | Žádné — hub volá API a renderuje sám | Minimální coupling, hub má vlastní design system |
+| Hosting backendu | Self-hosted Docker doma | Privacy zdravotních dat |
+| Vzdálený přístup | Cloudflare Tunnel | Žádný veřejný port, navazuje na CF stack |
+| SSO | Cloudflare Access | Zdarma, chrání hub i API jedním loginem |
+| Garmin | `python-garminconnect` | Funguje hned, šifrované creds |
+| DB | PostgreSQL | RRULE/JSONB queries, robustní |
+| Recurrence | RRULE šablona + materializované occurrences | Per-výskyt stav |
 
 ## 12. Otevřené otázky
 
-- Push notifikace na mobil — Web Push (potřebuje veřejnou URL, ne čistý Tailscale) vs.
-  jen in-app reminders. Rozhodnout v M3.
-- Šifrování Garmin credentials — Fernet symmetric key v `.env` stačí pro single-user
-  scénář; pokud bys chtěl víc, integrace s `pass` / 1Password CLI při startu.
-- Timezone handling — všechno v UTC v DB, převod na user TZ na hraně API. Sleep
-  `date` = "noc končící tímto datem v user TZ".
+- **Push notifikace** — CF Pages umí Web Push, ale subscribe endpoint by musel
+  existovat. Rozhodnout v M3.
+- **Schema validace na hraně** — sdílet TS typy mezi api a hub? Buď OpenAPI
+  schema → `openapi-typescript` v hub buildu, nebo ručně držet typy. Doporučuju
+  OpenAPI generování.
+- **Audit log akcí** — pro single-user není nutný, ale low-cost: tabulka
+  `audit_events` s JSONB. Rozhodnout dle chuti.
+
+## 13. Roadmap
+
+**M0 — Skeleton (1 den)**
+- Repo struktura, Docker Compose, Postgres, prázdné FastAPI s `/health`,
+  základ CF Access middleware (čte header, validuje JWT)
+
+**M1 — Tasks (3–5 dní)**
+- Models, Alembic, CRUD endpointy, RRULE engine, occurrences worker,
+  testy
+
+**M2 — Garmin sleep (2–3 dny)**
+- Adapter, šifrované creds, nightly sync, endpointy, error handling
+
+**M3 — Produkce (1–2 dny)**
+- Cloudflare Tunnel setup, Access aplikace, OpenAPI schema export pro hub,
+  backupy, manuální resync endpoint
