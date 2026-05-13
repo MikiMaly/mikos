@@ -8,6 +8,7 @@ from collections.abc import Sequence
 
 import sqlalchemy as sa
 from alembic import op
+from sqlalchemy.dialects import postgresql
 
 revision: str = "0001"
 down_revision: str | Sequence[str] | None = None
@@ -15,7 +16,19 @@ branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 
+# Reference column types — create_type=False so create_table won't re-emit CREATE TYPE.
+TASK_STATUS = postgresql.ENUM(
+    "active", "archived", name="task_status", create_type=False
+)
+OCCURRENCE_STATUS = postgresql.ENUM(
+    "pending", "done", "skipped", name="occurrence_status", create_type=False
+)
+
+
 def upgrade() -> None:
+    op.execute("CREATE TYPE task_status AS ENUM ('active', 'archived')")
+    op.execute("CREATE TYPE occurrence_status AS ENUM ('pending', 'done', 'skipped')")
+
     op.create_table(
         "users",
         sa.Column("id", sa.Integer, primary_key=True),
@@ -31,12 +44,6 @@ def upgrade() -> None:
         sa.UniqueConstraint("email", name="uq_users_email"),
     )
     op.create_index("ix_users_email", "users", ["email"])
-
-    task_status = sa.Enum("active", "archived", name="task_status")
-    task_status.create(op.get_bind(), checkfirst=True)
-
-    occurrence_status = sa.Enum("pending", "done", "skipped", name="occurrence_status")
-    occurrence_status.create(op.get_bind(), checkfirst=True)
 
     op.create_table(
         "tasks",
@@ -60,12 +67,7 @@ def upgrade() -> None:
         sa.Column("rrule", sa.Text),
         sa.Column("rrule_start", sa.Date),
         sa.Column("rrule_end", sa.Date),
-        sa.Column(
-            "status",
-            sa.Enum("active", "archived", name="task_status", create_type=False),
-            nullable=False,
-            server_default="active",
-        ),
+        sa.Column("status", TASK_STATUS, nullable=False, server_default="active"),
         sa.Column(
             "created_at",
             sa.DateTime(timezone=True),
@@ -95,7 +97,7 @@ def upgrade() -> None:
         sa.Column("occurs_at", sa.DateTime(timezone=True)),
         sa.Column(
             "status",
-            sa.Enum("pending", "done", "skipped", name="occurrence_status", create_type=False),
+            OCCURRENCE_STATUS,
             nullable=False,
             server_default="pending",
         ),
@@ -128,5 +130,5 @@ def downgrade() -> None:
     op.drop_table("tasks")
     op.drop_index("ix_users_email", table_name="users")
     op.drop_table("users")
-    sa.Enum(name="occurrence_status").drop(op.get_bind(), checkfirst=True)
-    sa.Enum(name="task_status").drop(op.get_bind(), checkfirst=True)
+    op.execute("DROP TYPE IF EXISTS occurrence_status")
+    op.execute("DROP TYPE IF EXISTS task_status")
